@@ -65,6 +65,15 @@ export const WORKER_WAKE_HITL_REARM_MS = 5 * 60_000;
  *  Codex/Gemini/grok worker would otherwise read as stalled forever and be
  *  nudged every cooldown while working — the repeated nudging #368 removed. */
 export const WORKER_WAKE_STALL_MS = 90_000;
+/** An agent with neither telemetry nor hooks (Copilot, Crush, …) can never show
+ *  the watchdog that it acted on a nudge, so a nudge swallowed by a still-drawing
+ *  TUI would otherwise be final (the edge trigger blocks every repeat). Instead
+ *  re-nudge it, still only when its terminal is quiet, every
+ *  WORKER_WAKE_BLIND_RETRY_MS up to WORKER_WAKE_BLIND_MAX_RETRIES times per
+ *  mail batch — bounded so a worker that is genuinely working is never nagged
+ *  the way #368 removed. */
+export const WORKER_WAKE_BLIND_RETRY_MS = 5 * 60_000;
+export const WORKER_WAKE_BLIND_MAX_RETRIES = 3;
 /** Minimum age of pending mail before a held worker is reported in the log. */
 export const WORKER_WAKE_REPORT_MS = 60_000;
 
@@ -203,6 +212,9 @@ export class WorkerWakeWatchdog {
   /** agentId → when its hold was last reported, so the beat logs a held worker
    *  once per cooldown instead of every 15 s. */
   private lastHoldReportAt = new Map<string, number>();
+  /** agentId → re-nudges already spent on the current mail batch of an agent
+   *  that has no activity channel (see WORKER_WAKE_BLIND_RETRY_MS). */
+  private blindRetries = new Map<string, number>();
 
   /** Record a PTY spawn so its boot sequence is left alone. */
   noteSpawn(ptyId: string, at = Date.now()): void {
@@ -228,9 +240,12 @@ export class WorkerWakeWatchdog {
    *  the hooks' — and OFF for an agent that has produced neither a telemetry
    *  sample nor a single hook event, because such an agent cannot show a turn
    *  even when it takes one (see WORKER_WAKE_STALL_MS). */
+  private isObservable(f: WorkerWakeFacts): boolean {
+    return !!f.hasTelemetry || this.hookSeenAt.has(f.agentId);
+  }
+
   private isStalled(f: WorkerWakeFacts, now: number): boolean {
-    const observable = !!f.hasTelemetry || this.hookSeenAt.has(f.agentId);
-    if (!observable) return false;
+    if (!this.isObservable(f)) return false;
     const lastActivityAt = Math.max(f.lastActivityAt ?? 0, this.turnHookAt(f.agentId));
     return isStalledWorker({ ...f, lastActivityAt }, now);
   }
@@ -243,6 +258,7 @@ export class WorkerWakeWatchdog {
     this.hookSeenAt.delete(agentId);
     this.lastTurnHookAt.delete(agentId);
     this.lastHoldReportAt.delete(agentId);
+    this.blindRetries.delete(agentId);
     if (ptyId) this.spawnedAt.delete(ptyId);
   }
 
@@ -269,8 +285,13 @@ export class WorkerWakeWatchdog {
     // Edge trigger (#358): mail already announced is not announced again — unless
     // the worker is stalled, i.e. it demonstrably never acted on the announcement.
     const announced = this.announcedInboxIds.get(f.agentId);
-    if (announced && !stalled && !Array.from(inboxIds).some((id) => !announced.has(id))) return 'announced';
     const lastNudge = this.lastNudgeAt.get(f.agentId) ?? 0;
+    if (announced && !stalled && !Array.from(inboxIds).some((id) => !announced.has(id))) {
+      const blindRetryDue = !this.isObservable(f)
+        && (this.blindRetries.get(f.agentId) ?? 0) < WORKER_WAKE_BLIND_MAX_RETRIES
+        && now - lastNudge >= WORKER_WAKE_BLIND_RETRY_MS;
+      if (!blindRetryDue) return 'announced';
+    }
     if (lastNudge > 0 && now - lastNudge < WORKER_WAKE_COOLDOWN_MS) return 'cooldown';
     return null;
   }
@@ -285,9 +306,14 @@ export class WorkerWakeWatchdog {
       const inboxIds = liveInboxIds(f);
       if (inboxIds.size === 0) {
         this.announcedInboxIds.delete(f.agentId);
+        this.blindRetries.delete(f.agentId);
         continue;
       }
       if (this.explain(f, now) !== null) continue;
+      const prev = this.announcedInboxIds.get(f.agentId);
+      const isRepeat = !!prev && Array.from(inboxIds).every((id) => prev.has(id));
+      if (isRepeat && !this.isObservable(f)) this.blindRetries.set(f.agentId, (this.blindRetries.get(f.agentId) ?? 0) + 1);
+      else if (!isRepeat) this.blindRetries.delete(f.agentId);
       this.lastNudgeAt.set(f.agentId, now);
       this.announcedInboxIds.set(f.agentId, inboxIds);
       out.push(f.agentId);
