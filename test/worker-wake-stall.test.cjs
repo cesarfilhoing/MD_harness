@@ -148,15 +148,15 @@ test('isTurnHook: prompt submits, tool boundaries and stops prove a turn; boot, 
 // every cooldown WHILE WORKING, until the file moved to .done — the repeated
 // nudging #368 removed. Now the hooks (which every shimmed engine sends) are
 // evidence too, and an agent with neither channel is never called stalled.
-test('an engine with no telemetry and no hook event is never stalled: the pre-stall rules apply unchanged (fail closed, #368)', () => {
+test('an engine with no telemetry and no hook event is not called stalled on fresh mail: the pre-stall rules apply (#368)', () => {
   const w = new WorkerWakeWatchdog();
   w.noteSpawn('pty-kevin', NOW - 20 * 60_000);
-  const working = codex({ oldestMailAt: NOW - 10 * 60_000 });
+  const working = codex({ oldestMailAt: NOW - (WORKER_WAKE_STALL_MS - 1) });
   assert.equal(w.explain(working, NOW), 'mid-turn', 'its chatty terminal is all we have, and it says busy');
   assert.deepEqual(w.decide([working], NOW), []);
-  const quiet = codex({ oldestMailAt: NOW - 10 * 60_000, lastOutputAt: NOW - WORKER_WAKE_IDLE_MS - 1 });
+  const quiet = codex({ oldestMailAt: NOW - 10_000, lastOutputAt: NOW - WORKER_WAKE_IDLE_MS - 1 });
   assert.deepEqual(w.decide([quiet], NOW), ['kevin'], 'a quiet terminal is nudged once, as before');
-  assert.equal(w.explain(quiet, NOW + WORKER_WAKE_COOLDOWN_MS + 1), 'announced', 'and never again for the same mail — no stall override without evidence');
+  assert.equal(w.explain(quiet, NOW + WORKER_WAKE_COOLDOWN_MS + 1), 'announced', 'and not again for the same fresh mail');
 });
 
 test('a hook-only engine whose hooks show no turn since the mail landed is stalled and nudged every cooldown', () => {
@@ -201,7 +201,7 @@ test('forget() drops the hook memory: a re-spawned agent starts unobservable aga
   assert.equal(w.explain(f, NOW), null, 'stalled while its hooks are known');
   w.forget('kevin', 'pty-kevin');
   w.noteSpawn('pty-kevin', NOW - 20 * 60_000);
-  assert.equal(w.explain(f, NOW), 'mid-turn', 'no hook seen this session → the stall rule is off');
+  assert.equal(w.explain({ ...f, oldestMailAt: NOW - 10_000 }, NOW), 'mid-turn', 'no hook seen this session → the hook-based stall rule is off');
   assert.equal(w.turnHookAt('kevin'), 0);
 });
 
@@ -247,33 +247,35 @@ test('a hold is reported once per cooldown per worker, and forget() resets it', 
   assert.equal(w.shouldReportHold('stanley', NOW + WORKER_WAKE_COOLDOWN_MS + 1_000), true);
 });
 
-// Copilot / Crush export neither telemetry nor hooks. A nudge swallowed while
-// the TUI was still drawing used to be final: "announced" blocked every repeat
-// and the stall rule is off without a channel. A bounded quiet-only retry
-// recovers it without the repeated nudging #368 removed.
-test('a blind engine (no telemetry, no hooks) is re-nudged when quiet, every retry window, up to the cap', () => {
+// Copilot / Crush export neither telemetry nor hooks and their TUI never goes
+// quiet, so the idle guard read "mid-turn" forever and the mail was never
+// announced. Old mail on such an agent is nudged regardless of output, with a
+// bounded, spaced retry series.
+test('a blind engine with old mail is nudged even on a chatty terminal, then retried on a spaced, capped schedule', () => {
   const w = new WorkerWakeWatchdog();
   w.noteSpawn('pty-kevin', NOW - 20 * 60_000);
-  const mk = (at) => codex({ oldestMailAt: NOW - 10 * 60_000, lastOutputAt: at - WORKER_WAKE_IDLE_MS - 1 });
+  const mk = (t) => codex({ oldestMailAt: NOW - 10 * 60_000, lastOutputAt: t - 500 });
   let t = NOW;
-  assert.deepEqual(w.decide([mk(t)], t), ['kevin'], 'first nudge');
+  assert.deepEqual(w.decide([mk(t)], t), ['kevin'], 'first nudge despite constant output');
   t += WORKER_WAKE_BLIND_RETRY_MS - 1;
-  assert.equal(w.explain(mk(t), t), 'announced', 'not before the retry window');
+  assert.notEqual(w.explain(mk(t), t), null, 'not before the retry window');
   for (let i = 0; i < WORKER_WAKE_BLIND_MAX_RETRIES; i++) {
     t += i === 0 ? 1 : WORKER_WAKE_BLIND_RETRY_MS;
     assert.deepEqual(w.decide([mk(t)], t), ['kevin'], `retry ${i + 1}`);
   }
   t += WORKER_WAKE_BLIND_RETRY_MS;
-  assert.equal(w.explain(mk(t), t), 'announced', 'capped');
+  assert.notEqual(w.explain(mk(t), t), null, 'capped');
 });
 
-test('blind-engine retries never fire into a chatty (mid-turn) terminal', () => {
+test('blind-engine nudges still respect HITL, pause and boot grace', () => {
   const w = new WorkerWakeWatchdog();
   w.noteSpawn('pty-kevin', NOW - 20 * 60_000);
-  const quiet = codex({ oldestMailAt: NOW - 10 * 60_000, lastOutputAt: NOW - WORKER_WAKE_IDLE_MS - 1 });
-  assert.deepEqual(w.decide([quiet], NOW), ['kevin']);
-  const later = NOW + WORKER_WAKE_BLIND_RETRY_MS;
-  assert.equal(w.explain({ ...quiet, lastOutputAt: later - 1_000 }, later), 'mid-turn');
+  w.noteHook('kevin', 'Notification', 'needs your permission', NOW - 1_000);
+  assert.equal(w.explain(codex({ oldestMailAt: NOW - 10 * 60_000 }), NOW), 'hitl');
+  const b = new WorkerWakeWatchdog();
+  b.noteSpawn('pty-kevin', NOW - 5_000);
+  assert.equal(b.explain(codex({ oldestMailAt: NOW - 10 * 60_000 }), NOW), 'boot-grace');
+  assert.equal(b.explain(codex({ oldestMailAt: NOW - 10 * 60_000, paused: true }), NOW), 'paused');
 });
 
 test('an observable engine gets no blind retries; fresh mail resets the retry budget', () => {
@@ -285,14 +287,14 @@ test('an observable engine gets no blind retries; fresh mail resets the retry bu
 
   const b = new WorkerWakeWatchdog();
   b.noteSpawn('pty-kevin', NOW - 20 * 60_000);
-  const f = codex({ oldestMailAt: NOW - 10 * 60_000, lastOutputAt: 1 });
+  const f = codex({ oldestMailAt: NOW - 10 * 60_000 });
   let t = NOW;
   b.decide([f], t);
   for (let i = 0; i < WORKER_WAKE_BLIND_MAX_RETRIES; i++) { t += WORKER_WAKE_BLIND_RETRY_MS; b.decide([f], t); }
   t += WORKER_WAKE_BLIND_RETRY_MS;
-  assert.equal(b.explain(f, t), 'announced');
-  const fresh = { ...f, inboxIds: ['mail-1', 'mail-2'] };
+  assert.notEqual(b.explain(f, t), null, 'budget spent');
+  const fresh = { ...f, inboxIds: ['mail-1', 'mail-2'], lastOutputAt: 1 };
   assert.deepEqual(b.decide([fresh], t), ['kevin'], 'new mail is announced as usual');
   t += WORKER_WAKE_BLIND_RETRY_MS;
-  assert.equal(b.explain(fresh, t), null, 'and its retry budget starts over');
+  assert.equal(b.explain(f, t), null, 'and its retry budget starts over');
 });

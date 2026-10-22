@@ -66,12 +66,14 @@ export const WORKER_WAKE_HITL_REARM_MS = 5 * 60_000;
  *  nudged every cooldown while working — the repeated nudging #368 removed. */
 export const WORKER_WAKE_STALL_MS = 90_000;
 /** An agent with neither telemetry nor hooks (Copilot, Crush, …) can never show
- *  the watchdog that it acted on a nudge, so a nudge swallowed by a still-drawing
- *  TUI would otherwise be final (the edge trigger blocks every repeat). Instead
- *  re-nudge it, still only when its terminal is quiet, every
- *  WORKER_WAKE_BLIND_RETRY_MS up to WORKER_WAKE_BLIND_MAX_RETRIES times per
- *  mail batch — bounded so a worker that is genuinely working is never nagged
- *  the way #368 removed. */
+ *  the watchdog a turn, and its TUI never goes quiet, so the idle guard reads
+ *  "mid-turn" forever and the mail is never announced (observed live
+ *  2026-10-22: Copilot workers held "mid-turn, pty quiet 0-1s, last activity
+ *  never" on a work order until the human typed into them). Once its mail is
+ *  WORKER_WAKE_STALL_MS old, nudge it regardless of terminal output, then re-nudge
+ *  every WORKER_WAKE_BLIND_RETRY_MS up to WORKER_WAKE_BLIND_MAX_RETRIES more
+ *  times per mail batch — bounded, so a worker that is genuinely working is never
+ *  nagged the way #368 removed. */
 export const WORKER_WAKE_BLIND_RETRY_MS = 5 * 60_000;
 export const WORKER_WAKE_BLIND_MAX_RETRIES = 3;
 /** Minimum age of pending mail before a held worker is reported in the log. */
@@ -237,17 +239,27 @@ export class WorkerWakeWatchdog {
   }
 
   /** The stall rule on everything known: the beat's telemetry evidence plus
-   *  the hooks' — and OFF for an agent that has produced neither a telemetry
-   *  sample nor a single hook event, because such an agent cannot show a turn
-   *  even when it takes one (see WORKER_WAKE_STALL_MS). */
+   *  the hooks'. An agent with neither a telemetry sample nor a single hook
+   *  event cannot show a turn, so it gets the bounded blind rule instead
+   *  (see WORKER_WAKE_BLIND_RETRY_MS). */
   private isObservable(f: WorkerWakeFacts): boolean {
     return !!f.hasTelemetry || this.hookSeenAt.has(f.agentId);
   }
 
   private isStalled(f: WorkerWakeFacts, now: number): boolean {
-    if (!this.isObservable(f)) return false;
+    if (!this.isObservable(f)) return this.isBlindStalled(f, now);
     const lastActivityAt = Math.max(f.lastActivityAt ?? 0, this.turnHookAt(f.agentId));
     return isStalledWorker({ ...f, lastActivityAt }, now);
+  }
+
+  /** No activity channel at all: the only evidence is mail age, so allow a
+   *  bounded, spaced series of nudges (see WORKER_WAKE_BLIND_RETRY_MS). */
+  private isBlindStalled(f: WorkerWakeFacts, now: number): boolean {
+    const mailAt = f.oldestMailAt ?? 0;
+    if (mailAt <= 0 || now - mailAt < WORKER_WAKE_STALL_MS) return false;
+    if ((this.blindRetries.get(f.agentId) ?? 0) >= WORKER_WAKE_BLIND_MAX_RETRIES) return false;
+    const lastNudge = this.lastNudgeAt.get(f.agentId) ?? 0;
+    return lastNudge === 0 || now - lastNudge >= WORKER_WAKE_BLIND_RETRY_MS;
   }
 
   /** Forget per-agent state (e.g. the agent's PTY was closed). */
@@ -286,12 +298,7 @@ export class WorkerWakeWatchdog {
     // the worker is stalled, i.e. it demonstrably never acted on the announcement.
     const announced = this.announcedInboxIds.get(f.agentId);
     const lastNudge = this.lastNudgeAt.get(f.agentId) ?? 0;
-    if (announced && !stalled && !Array.from(inboxIds).some((id) => !announced.has(id))) {
-      const blindRetryDue = !this.isObservable(f)
-        && (this.blindRetries.get(f.agentId) ?? 0) < WORKER_WAKE_BLIND_MAX_RETRIES
-        && now - lastNudge >= WORKER_WAKE_BLIND_RETRY_MS;
-      if (!blindRetryDue) return 'announced';
-    }
+    if (announced && !stalled && !Array.from(inboxIds).some((id) => !announced.has(id))) return 'announced';
     if (lastNudge > 0 && now - lastNudge < WORKER_WAKE_COOLDOWN_MS) return 'cooldown';
     return null;
   }
